@@ -1,0 +1,81 @@
+# ===========================================================================
+#  .gitignore -- must be in place BEFORE the first `git init`
+#
+#  The working tree holds ~210 MB of NVIDIA proprietary binaries and SDK files.
+#  If any of them are committed even once, they stay in git history forever and
+#  pushing means redistributing them -- which their licences prohibit. So the
+#  rules below are the most important file in this repository.
+#
+#  See docs/THIRD_PARTY.md for the reasoning and per-component status.
+# ===========================================================================
+
+# --- NVIDIA proprietary runtime / models (never redistributable) -----------
+nvngx*.dll
+NVVideoEffects.dll
+NVCVImage.dll
+nvVFXVideoSuperRes.dll
+NvOF*.dll
+nvofapi*.dll
+
+# --- official SDKs: obtain them yourself, do not vendor them ---------------
+deps/
+
+# --- the DirectShow filter is its OWN repository ---------------------------
+# It lives here only until you move it to D:\VSCODE\dlssnr-filter. It must never
+# be committed into this repo: it has its own history, licence and .gitignore.
+# If you already moved it out, this rule is simply inert.
+dlssnr-filter/
+
+# --- everything under app/ that is NOT source ------------------------------
+# app\ holds the Python modules (tracked) plus all the native DLLs (ignored).
+app/*.dll
+app/*.lib
+app/*.exp
+
+# --- build output ---------------------------------------------------------
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.res
+*.map
+build/
+dist/
+*.spec
+
+# --- runtime logs / probes / scratch --------------------------------------
+*.log
+*.log.old
+*_perf.on
+*_perf.txt
+dlss_run.log
+host2_log.txt
+vfx_log.txt
+thdr_log.txt
+
+# --- generated media ------------------------------------------------------
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.webm
+*.npy
+*.png.tmp
+
+# --- Python --------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# --- local / personal ----------------------------------------------------
+src/BuildOptions.props.user
+*.user
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
