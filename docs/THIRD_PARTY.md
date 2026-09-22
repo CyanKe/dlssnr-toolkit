@@ -38,11 +38,15 @@ redistribute it in this project's source tree or in binary releases.
 
 > **The DirectShow filter is not in this repository.** It lives in the separate
 > **dlssnr-filter** repository, under its own MIT licence and with no upstream
-> attribution obligations. The two repositories share only the binary interface of
-> `dlssnr_host2.dll`; see that repository's `docs/ENGINE_INTERFACE.md`.
+> attribution obligations. The two repositories are fully independent: no shared
+> source and no binary contract (the filter carries its own built-in GPU engine).
 >
 > **滤镜不在本仓库。** 它位于独立的 **dlssnr-filter** 仓库，采用自己的 MIT 许可，
-> 且不承担上游署名义务。两个仓库之间唯一的约定是 `dlssnr_host2.dll` 的二进制接口。
+> 且不承担上游署名义务。两仓库完全独立：无共享源码、无二进制约定（滤镜自带内置 GPU 引擎）。
+>
+> Historical note / 历史注记：两仓库早期曾共用 `dlssnr_host2.dll` 的二进制接口
+> （曾记于滤镜仓库的 `docs/ENGINE_INTERFACE.md`）；滤镜内置引擎后该约定已废止、
+> 文档已删除。这段历史**仅备查**，以两仓库现状为准。
 
 > **Note on `nvngx_dlssnr.dll`:** this is the one component with no clean answer. It is
 > NVIDIA's DLSS "NR" snippet, but the specific binary this project was developed against

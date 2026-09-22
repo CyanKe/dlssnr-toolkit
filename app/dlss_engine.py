@@ -352,6 +352,97 @@ class Engine2:
         self._ready = False
         self._w = self._h = 0
 
+    # ------------------------------------------------------ multi-layer chain
+    def process_chain(self, bgr, layers, reset=False, out_rgba=False):
+        """Run several parameter sets back to back on ONE frame.
+
+        Each layer is a complete round trip (upload -> inference -> readback),
+        so N layers costs roughly N times a single pass -- the inference itself
+        dominates. The host's channel-count is fixed at 3 for the BGR path, so
+        the intermediates ping-pong between two of our own buffers by passing
+        both pointers to dlssnr2_process; no Python-side copy is involved. When
+        out_rgba is set the LAST layer writes RGBA straight out, so a chain never
+        pays an extra colour conversion.
+
+        Caveat worth knowing: all layers share this one NGX feature, i.e. one
+        temporal history. So this is "the same network run twice per frame with
+        different settings", not two independent filters with separate state.
+
+        Returns the final image (RGBA if out_rgba else BGR, both reusing an
+        internal buffer -- consume before the next call), or None on failure.
+        """
+        layers = [dict(l) for l in (layers or []) if l]
+        if not layers:
+            return None
+        h, w = bgr.shape[:2]
+        if not (self._ready and self._w == w and self._h == h):
+            self.ensure(w, h)
+        if len(layers) == 1:
+            self.set_settings(layers[0])
+            return (self.process_rgba(bgr, reset=reset) if out_rgba
+                    else self.process(bgr, reset=reset))
+        if (getattr(self, "_chain_a", None) is None
+                or self._chain_a.shape[:2] != (h, w)):
+            self._chain_a = np.empty((h, w, 3), np.uint8)
+            self._chain_b = np.empty((h, w, 3), np.uint8)
+        flag = 1 if reset else 0
+        src = bgr
+        n = len(layers)
+        for i, layer in enumerate(layers):
+            self.set_settings(layer)
+            if i == n - 1 and out_rgba:
+                out = self._out4
+                ok = self._lib.dlssnr2_process_rgba(
+                    src.ctypes.data_as(ctypes.c_void_p),
+                    out.ctypes.data_as(ctypes.c_void_p), flag)
+                return out if ok else None
+            dst = self._chain_a if (i % 2 == 0) else self._chain_b
+            ok = self._lib.dlssnr2_process(
+                src.ctypes.data_as(ctypes.c_void_p),
+                dst.ctypes.data_as(ctypes.c_void_p), flag)
+            if not ok:
+                return None
+            src = dst            # next layer reads what this one wrote
+        return src
+
+
+class ChainEngine:
+    """Adapter so rtx_video.Pipeline can drive a multi-layer chain.
+
+    Pipeline only needs ensure()/process(), so wrapping the layer list here keeps
+    rtx_video.py unaware of layering. It also closes a latent bug: the RTX chain
+    never pushed its settings to the engine at all, so a queued task with
+    different parameters exported with whatever the last preview had left behind.
+    Now the job's own settings are applied before its first frame.
+    """
+
+    def __init__(self, settings, engine=None):
+        self.engine = engine if engine is not None else engine2
+        self._wh = None
+        self.set_settings(settings)
+
+    def set_settings(self, settings):
+        self.settings = dict(settings or {})
+        self.layers = [dict(l) for l in (self.settings.get("layers") or []) if l]
+        self._wh = None
+
+    def ensure(self, w, h):
+        if self._wh != (w, h):
+            self.engine.set_settings(self.settings)
+            self._wh = (w, h)
+        return self.engine.ensure(w, h)
+
+    def process(self, bgr, reset=False):
+        if len(self.layers) > 1:
+            return self.engine.process_chain(bgr, self.layers, reset=reset)
+        return self.engine.process(bgr, reset=reset)
+
+    def pending(self):
+        return 0
+
+    def drain(self):
+        pass
+
 
 engine2 = Engine2()
 

@@ -11,9 +11,9 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-echo Checking / installing dependencies (numpy, opencv-python)...
+echo Checking / installing dependencies (numpy, opencv-python, pillow, tkinterdnd2)...
 python -m pip install --upgrade pip >nul 2>nul
-python -m pip install numpy opencv-python
+python -m pip install numpy opencv-python pillow tkinterdnd2
 echo.
 echo ========================================
 echo  Dependencies installed.
