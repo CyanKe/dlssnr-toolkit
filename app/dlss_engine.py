@@ -207,6 +207,20 @@ HOST2_DLL = os.path.join(BASE, "dlssnr_host2.dll")
 _lib2 = None
 
 
+class LayerOpts(ctypes.Structure):
+    """One layer's parameters for dlssnr2_chain().
+
+    Layout must match DlssnrLayerOpts in src/dlssnr_host2.cpp: six 4-byte
+    fields, 24 bytes, no padding.
+    """
+    _fields_ = [("style", ctypes.c_int),
+                ("intensity", ctypes.c_float),
+                ("local_tone", ctypes.c_float),
+                ("local_struct", ctypes.c_float),
+                ("skin_struct", ctypes.c_float),
+                ("use_auto_mask", ctypes.c_int)]
+
+
 def _load2():
     global _lib2
     if _lib2 is None:
@@ -235,6 +249,16 @@ def _load2():
                                             ctypes.POINTER(ctypes.c_int)]
         _lib2.dlssnr2_get_sizes.restype = None
         _lib2.dlssnr2_shutdown.argtypes = []
+        # dlssnr2_chain (multi-layer, one feature per layer) is newer than the
+        # rest of the API, so an older DLL simply does not have it: process_chain
+        # then falls back to N passes on the single feature.
+        try:
+            _lib2.dlssnr2_chain.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                ctypes.POINTER(LayerOpts), ctypes.c_int, ctypes.c_int]
+            _lib2.dlssnr2_chain.restype = ctypes.c_int
+        except AttributeError:
+            pass
     return _lib2
 
 
@@ -356,20 +380,24 @@ class Engine2:
     def process_chain(self, bgr, layers, reset=False, out_rgba=False):
         """Run several parameter sets back to back on ONE frame.
 
-        Each layer is a complete round trip (upload -> inference -> readback),
-        so N layers costs roughly N times a single pass -- the inference itself
-        dominates. The host's channel-count is fixed at 3 for the BGR path, so
-        the intermediates ping-pong between two of our own buffers by passing
-        both pointers to dlssnr2_process; no Python-side copy is involved. When
-        out_rgba is set the LAST layer writes RGBA straight out, so a chain never
-        pays an extra colour conversion.
+        Preferred path: the host's own dlssnr2_chain(), which gives every layer
+        its OWN NGX feature (i.e. its own temporal history) and records the whole
+        chain into one command list -- one upload, one fence wait, one readback
+        per frame instead of N.
 
-        Caveat worth knowing: all layers share this one NGX feature, i.e. one
-        temporal history. So this is "the same network run twice per frame with
-        different settings", not two independent filters with separate state.
+        Why that matters: running the same feature twice per frame makes the
+        second pass see a history equal to its own input. With zero motion
+        vectors the network reads that as "nothing moved, trust the history",
+        which doubles the loop gain of the temporal recursion -- measured 3.6x
+        the flat-area level instability of a single pass (0.50 vs 0.14 gray
+        levels on a moving flat field). With one feature per layer it drops to
+        ~1.7x, which is just the two filters' own residuals adding in quadrature.
 
-        Returns the final image (RGBA if out_rgba else BGR, both reusing an
-        internal buffer -- consume before the next call), or None on failure.
+        Fallback (older DLL without dlssnr2_chain): N passes on the one feature,
+        ping-ponging two buffers through dlssnr2_process' own in/out pointers.
+
+        Returns the final image (RGBA if out_rgba else BGR, reusing an internal
+        buffer -- consume before the next call), or None on failure.
         """
         layers = [dict(l) for l in (layers or []) if l]
         if not layers:
@@ -381,6 +409,25 @@ class Engine2:
             self.set_settings(layers[0])
             return (self.process_rgba(bgr, reset=reset) if out_rgba
                     else self.process(bgr, reset=reset))
+
+        if getattr(self._lib, "dlssnr2_chain", None) is not None:
+            arr = (LayerOpts * len(layers))()
+            for i, L in enumerate(layers):
+                arr[i] = LayerOpts(
+                    int(L.get("style", 0)),
+                    float(L.get("intensity", 1.0)),
+                    float(L.get("local_tone", 1.0)),
+                    float(L.get("local_struct", 1.0)),
+                    float(L.get("skin_struct", 0.0)),
+                    int(L.get("use_auto_mask", 0)))
+            out = self._out4 if out_rgba else self._out3
+            ok = self._lib.dlssnr2_chain(
+                bgr.ctypes.data_as(ctypes.c_void_p),
+                None if out_rgba else out.ctypes.data_as(ctypes.c_void_p),
+                out.ctypes.data_as(ctypes.c_void_p) if out_rgba else None,
+                arr, len(layers), 1 if reset else 0)
+            return out if ok == 1 else None
+
         if (getattr(self, "_chain_a", None) is None
                 or self._chain_a.shape[:2] != (h, w)):
             self._chain_a = np.empty((h, w, 3), np.uint8)

@@ -39,6 +39,15 @@
 //   -- synchronous (preview) --
 //   dlssnr2_process(inBgr, outBgr, reset)           -> BGR in / BGR out
 //   dlssnr2_process_rgba(inBgr, outRgba, reset)     -> BGR in / RGBA out
+//   -- multi-layer, one command list, one feature per layer --
+//   dlssnr2_chain(inBgr, outBgr, outRgba, layers, nLayers, reset)
+//                                                   -> 1 ok / 0 fail
+//       layers : const DlssnrLayerOpts* (style, intensity, localTone,
+//                localStruct, skinStruct, autoMask), 24 bytes each
+//       Each layer gets its OWN NGX feature, so each has its own temporal
+//       history. Sharing one feature across layers makes the 2nd pass see a
+//       history equal to its own input, which doubles the temporal loop gain
+//       and pulses flat areas (measured 3.6x vs 1.7x on the test sequence).
 //   -- pipelined (export) --
 //   dlssnr2_submit(inBgr, reset)                    -> 1 ok (no wait)
 //   dlssnr2_fetch(outRgba, outBgr)                  -> frames left in flight, -1 err
@@ -269,6 +278,21 @@ struct Slot {
 #endif
 static const int kSlots = DLSSNR_SLOTS;
 
+// Maximum number of DLSSNR layers in one dlssnr2_chain() call.
+static const int kMaxLayers = 8;
+
+// Public ABI: one layer's parameters. Plain data with no pointers so a caller
+// (Python/ctypes) can build an array of these directly. Layout is 4-byte fields
+// only, i.e. 24 bytes with no padding.
+struct DlssnrLayerOpts {
+    int   style;
+    float intensity;
+    float localTone;
+    float localStruct;
+    float skinStruct;
+    int   autoMask;
+};
+
 struct HostState {
     ID3D12Device* device = nullptr;
     ID3D12CommandQueue* queue = nullptr;
@@ -284,7 +308,13 @@ struct HostState {
     FnEvaluateFeature fnEval = nullptr;
     FnReleaseFeature fnRelease = nullptr;
 
-    NVSDK_NGX_Handle* feature = nullptr;
+    // One NGX feature per layer. A feature owns its temporal history, so each
+    // layer needs its own: running the SAME feature twice per frame makes the
+    // second pass see a history that equals its own input, which doubles the
+    // loop gain of the temporal recursion and pulses flat areas (measured 2-4x
+    // the single-pass level instability).
+    NVSDK_NGX_Handle* features[kMaxLayers] = {};
+    int nFeatures = 0;
     NVSDK_NGX_Parameter* params = nullptr;
 
     Slot slots[kSlots];
@@ -420,11 +450,14 @@ static void ReleaseFeatureAndTextures() {
         g.queue->Signal(g.fence, g.fenceValue);
         WaitForFence(g.fenceValue);
     }
-    if (g.feature) {
-        if (g.fnRelease) g.fnRelease(g.feature);
-        else NVSDK_NGX_D3D12_ReleaseFeature(g.feature);
-        g.feature = nullptr;
+    for (int i = 0; i < kMaxLayers; ++i) {
+        if (g.features[i]) {
+            if (g.fnRelease) g.fnRelease(g.features[i]);
+            else NVSDK_NGX_D3D12_ReleaseFeature(g.features[i]);
+            g.features[i] = nullptr;
+        }
     }
+    g.nFeatures = 0;
     if (g.params) { NVSDK_NGX_D3D12_DestroyParameters(g.params); g.params = nullptr; }
 
     for (int s = 0; s < kSlots; ++s) {
@@ -537,7 +570,8 @@ static bool CreateFeature(int w, int h) {
         FAILED(g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, a, nullptr, IID_PPV_ARGS(&c)))) {
         HLog("create cmd for feature fail"); return false;
     }
-    NVSDK_NGX_Result r = g.fnCreate(c, (NVSDK_NGX_Feature)18, g.params, &g.feature);
+    NVSDK_NGX_Handle* handle = nullptr;
+    NVSDK_NGX_Result r = g.fnCreate(c, (NVSDK_NGX_Feature)18, g.params, &handle);
     c->Close();
     ID3D12CommandList* lists[] = { c };
     g.queue->ExecuteCommandLists(1, lists);
@@ -545,8 +579,43 @@ static bool CreateFeature(int w, int h) {
     g.queue->Signal(g.fence, v);
     WaitForFence(v);
     a->Release(); c->Release();
-    if (r != NVSDK_NGX_Result_Success || !g.feature) {
+    if (r != NVSDK_NGX_Result_Success || !handle) {
         HLog("CreateFeature fail 0x%08X", (unsigned)r); return false;
+    }
+    g.features[0] = handle;
+    if (g.nFeatures < 1) g.nFeatures = 1;
+    return true;
+}
+
+// Create features up to `n` (the chain wants one per layer). Feature creation
+// needs a command list, and NGX's own setup work is submitted through it, so
+// each new feature gets its own short-lived list -- this only happens when the
+// layer count or the frame size changes.
+static bool EnsureFeatures(int n) {
+    if (n < 1) n = 1;
+    if (n > kMaxLayers) { HLog("EnsureFeatures: %d > %d", n, kMaxLayers); return false; }
+    for (int i = 0; i < n; ++i) {
+        if (g.features[i]) continue;
+        ID3D12CommandAllocator* a = nullptr; ID3D12GraphicsCommandList* c = nullptr;
+        if (FAILED(g.device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&a))) ||
+            FAILED(g.device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, a, nullptr, IID_PPV_ARGS(&c)))) {
+            HLog("layer %d: create cmd fail", i); return false;
+        }
+        NVSDK_NGX_Handle* handle = nullptr;
+        NVSDK_NGX_Result r = g.fnCreate(c, (NVSDK_NGX_Feature)18, g.params, &handle);
+        c->Close();
+        ID3D12CommandList* lists[] = { c };
+        g.queue->ExecuteCommandLists(1, lists);
+        uint64_t v = ++g.fenceValue;
+        g.queue->Signal(g.fence, v);
+        WaitForFence(v);
+        a->Release(); c->Release();
+        if (r != NVSDK_NGX_Result_Success || !handle) {
+            HLog("CreateFeature[%d] fail 0x%08X", i, (unsigned)r); return false;
+        }
+        g.features[i] = handle;
+        if (g.nFeatures < i + 1) g.nFeatures = i + 1;
+        HLog("layer %d: own NGX feature created", i);
     }
     return true;
 }
@@ -867,48 +936,18 @@ __declspec(dllexport) int dlssnr2_aux_test(int which, int fmtSel, int pattern, f
 // GPU-bound and CPU-bound pipelines. Slots only bound how many frames may be
 // queued at once; they do not create throughput.
 // ===========================================================================
-static int SubmitCore(const uint8_t* inBgr, int reset) {
-    if (!g.inited || !g.feature) { HLog("submit: not inited"); return 0; }
-    if (g.pending >= kSlots) { HLog("submit: pipeline full"); return 0; }
-
-    Slot& sl = g.slots[g.submitIdx];
-    const double t0 = NowMs();
+// ---------------------------------------------------------------------------
+// Per-evaluate parameter binding, shared by the single-pass path and the chain.
+// Callers differ only in which textures go in and out.
+// ---------------------------------------------------------------------------
+static void BindEvalParams(ID3D12GraphicsCommandList* cmd, ID3D12Resource* in,
+                           ID3D12Resource* out, int reset) {
     const int W = g.w, H = g.h;
+    BarrierOn(cmd, g.texZeroMV, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+    BarrierOn(cmd, g.texZeroDepth, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
 
-    // ---- 1. CPU: BGR -> RGBA into this slot's staging buffer ----
-    uint8_t* mapped = nullptr;
-    D3D12_RANGE noRead{ 0, 0 };
-    if (FAILED(sl.uploadBuf->Map(0, &noRead, (void**)&mapped))) { HLog("upload map fail"); return 0; }
-    for (int y = 0; y < H; ++y)
-        BGR2RGBA_row(inBgr + (size_t)y * W * 3, mapped + (size_t)y * W * 4, W);
-    sl.uploadBuf->Unmap(0, nullptr);
-    const double t1 = NowMs(); HPerf("convIn", t1 - t0);
-
-    // ---- 2. record: upload -> eval -> readback in ONE command list ----
-    // Safe to reset: this slot's previous submission was already fetched.
-    if (FAILED(sl.alloc->Reset()) || FAILED(sl.cmd->Reset(sl.alloc, nullptr))) {
-        HLog("cmd reset fail"); return 0;
-    }
-
-    D3D12_TEXTURE_COPY_LOCATION dst{}; dst.pResource = sl.texIn;
-    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dst.SubresourceIndex = 0;
-    D3D12_TEXTURE_COPY_LOCATION src{}; src.pResource = sl.uploadBuf;
-    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-    src.PlacedFootprint.Footprint.Width = W;
-    src.PlacedFootprint.Footprint.Height = H;
-    src.PlacedFootprint.Footprint.Depth = 1;
-    src.PlacedFootprint.Footprint.RowPitch = W * 4;
-    src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    BarrierOn(sl.cmd, sl.texIn, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
-    sl.cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
-    BarrierOn(sl.cmd, sl.texIn, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-
-    BarrierOn(sl.cmd, sl.texOut, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    BarrierOn(sl.cmd, g.texZeroMV, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-    BarrierOn(sl.cmd, g.texZeroDepth, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
-
-    g.params->Set("DLSSNR.Color", sl.texIn);
-    g.params->Set("DLSSNR.Output", sl.texOut);
+    g.params->Set("DLSSNR.Color", in);
+    g.params->Set("DLSSNR.Output", out);
     g.params->Set("DLSSNR.MVec", g.texZeroMV);
     g.params->Set("DLSSNR.Depth", g.texZeroDepth);
     g.params->Set("DLSSNR.Reset", reset ? 1 : 0);
@@ -934,20 +973,54 @@ static int SubmitCore(const uint8_t* inBgr, int reset) {
     g.params->Set("DLSSNR.Enabled", 1);
 
     // experiment-only optional guidance inputs (all null in production)
-    if (g.texBidir) BindAuxTex(sl.cmd, "DLSSNR.BidirectionalDistortionField", g.texBidir, W, H);
-    if (g.texCtrl)  BindAuxTex(sl.cmd, "DLSSNR.ControlMask",  g.texCtrl,  W, H);
-    if (g.texUI)    BindAuxTex(sl.cmd, "DLSSNR.UI",           g.texUI,    W, H);
-    if (g.texUIA)   BindAuxTex(sl.cmd, "DLSSNR.UIAlpha",      g.texUIA,   W, H);
+    if (g.texBidir) BindAuxTex(cmd, "DLSSNR.BidirectionalDistortionField", g.texBidir, W, H);
+    if (g.texCtrl)  BindAuxTex(cmd, "DLSSNR.ControlMask",  g.texCtrl,  W, H);
+    if (g.texUI)    BindAuxTex(cmd, "DLSSNR.UI",           g.texUI,    W, H);
+    if (g.texUIA)   BindAuxTex(cmd, "DLSSNR.UIAlpha",      g.texUIA,   W, H);
+}
 
-    NVSDK_NGX_Result r = g.fnEval(sl.cmd, g.feature, g.params, nullptr);
-    if (r != NVSDK_NGX_Result_Success) {
-        HLog("EvaluateFeature fail 0x%08X", (unsigned)r);
-        sl.cmd->Close();
-        return 0;
-    }
-    const double t2 = NowMs(); HPerf("eval", t2 - t1);
+// Undo the shared-texture binds above so the next frame sees them in COMMON.
+static void UnbindEvalParams(ID3D12GraphicsCommandList* cmd) {
+    BarrierOn(cmd, g.texZeroMV, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    BarrierOn(cmd, g.texZeroDepth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    if (g.texBidir) BarrierOn(cmd, g.texBidir, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    if (g.texCtrl)  BarrierOn(cmd, g.texCtrl,  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    if (g.texUI)    BarrierOn(cmd, g.texUI,    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    if (g.texUIA)   BarrierOn(cmd, g.texUIA,   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+}
 
-    BarrierOn(sl.cmd, sl.texOut, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
+// One layer's own settings onto the shared parameter object. The textures and
+// everything else stay as BindEvalParams left them.
+static void SetLayerParams(const DlssnrLayerOpts& L) {
+    g.params->Set("DLSSNR.Style", L.style);
+    g.params->Set("DLSSNR.Intensity", L.intensity);
+    g.params->Set("DLSSNR.LocalToneStrength", L.localTone);
+    g.params->Set("DLSSNR.LocalStructureStrength", L.localStruct);
+    g.params->Set("DLSSNR.SkinStructureStrength", L.skinStruct);
+    g.params->Set("DLSSNR.UseAutoMask", L.autoMask);
+}
+
+// upload buffer -> texIn, leaving texIn readable as a shader resource
+static void UploadToTexIn(Slot& sl) {
+    const int W = g.w, H = g.h;
+    D3D12_TEXTURE_COPY_LOCATION dst{}; dst.pResource = sl.texIn;
+    dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dst.SubresourceIndex = 0;
+    D3D12_TEXTURE_COPY_LOCATION src{}; src.pResource = sl.uploadBuf;
+    src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    src.PlacedFootprint.Footprint.Width = W;
+    src.PlacedFootprint.Footprint.Height = H;
+    src.PlacedFootprint.Footprint.Depth = 1;
+    src.PlacedFootprint.Footprint.RowPitch = W * 4;
+    src.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    BarrierOn(sl.cmd, sl.texIn, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST);
+    sl.cmd->CopyTextureRegion(&dst, 0, 0, 0, &src, nullptr);
+    BarrierOn(sl.cmd, sl.texIn, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+}
+
+// eval result texture -> this slot's readback heap
+static void TexToReadback(Slot& sl, ID3D12Resource* tex) {
+    const int W = g.w, H = g.h;
+    BarrierOn(sl.cmd, tex, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE);
     D3D12_TEXTURE_COPY_LOCATION rdst{}; rdst.pResource = sl.readbackBuf;
     rdst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
     rdst.PlacedFootprint.Footprint.Width = W;
@@ -955,19 +1028,71 @@ static int SubmitCore(const uint8_t* inBgr, int reset) {
     rdst.PlacedFootprint.Footprint.Depth = 1;
     rdst.PlacedFootprint.Footprint.RowPitch = W * 4;
     rdst.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    D3D12_TEXTURE_COPY_LOCATION rsrc{}; rsrc.pResource = sl.texOut;
+    D3D12_TEXTURE_COPY_LOCATION rsrc{}; rsrc.pResource = tex;
     rsrc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; rsrc.SubresourceIndex = 0;
     sl.cmd->CopyTextureRegion(&rdst, 0, 0, 0, &rsrc, nullptr);
+}
+
+// readback heap -> caller's buffer (RGBA memcpy, or the SIMD RGBA->BGR swizzle)
+static bool ReadbackTo(Slot& sl, uint8_t* outBgr, uint8_t* outRgba) {
+    const int W = g.w, H = g.h;
+    const size_t planePx = (size_t)W * H;
+    uint8_t* rb = nullptr;
+    D3D12_RANGE readRange{ 0, planePx * 4 };
+    if (FAILED(sl.readbackBuf->Map(0, &readRange, (void**)&rb))) {
+        HLog("readback map fail"); return false;
+    }
+    if (outRgba) {
+        memcpy(outRgba, rb, planePx * 4);
+    } else if (outBgr) {
+        for (int y = 0; y < H; ++y)
+            RGBA2BGR_row(rb + (size_t)y * W * 4, outBgr + (size_t)y * W * 3, W);
+    }
+    sl.readbackBuf->Unmap(0, nullptr);
+    return true;
+}
+
+static int SubmitCore(const uint8_t* inBgr, int reset) {
+    if (!g.inited || !g.features[0]) { HLog("submit: not inited"); return 0; }
+    if (g.pending >= kSlots) { HLog("submit: pipeline full"); return 0; }
+
+    Slot& sl = g.slots[g.submitIdx];
+    const double t0 = NowMs();
+    const int W = g.w, H = g.h;
+
+    // ---- 1. CPU: BGR -> RGBA into this slot's staging buffer ----
+    uint8_t* mapped = nullptr;
+    D3D12_RANGE noRead{ 0, 0 };
+    if (FAILED(sl.uploadBuf->Map(0, &noRead, (void**)&mapped))) { HLog("upload map fail"); return 0; }
+    for (int y = 0; y < H; ++y)
+        BGR2RGBA_row(inBgr + (size_t)y * W * 3, mapped + (size_t)y * W * 4, W);
+    sl.uploadBuf->Unmap(0, nullptr);
+    const double t1 = NowMs(); HPerf("convIn", t1 - t0);
+
+    // ---- 2. record: upload -> eval -> readback in ONE command list ----
+    // Safe to reset: this slot's previous submission was already fetched.
+    if (FAILED(sl.alloc->Reset()) || FAILED(sl.cmd->Reset(sl.alloc, nullptr))) {
+        HLog("cmd reset fail"); return 0;
+    }
+
+    UploadToTexIn(sl);
+    BarrierOn(sl.cmd, sl.texOut, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    BindEvalParams(sl.cmd, sl.texIn, sl.texOut, reset);
+
+    NVSDK_NGX_Result r = g.fnEval(sl.cmd, g.features[0], g.params, nullptr);
+    if (r != NVSDK_NGX_Result_Success) {
+        HLog("EvaluateFeature fail 0x%08X", (unsigned)r);
+        sl.cmd->Close();
+        return 0;
+    }
+    const double t2 = NowMs(); HPerf("eval", t2 - t1);
+
+    TexToReadback(sl, sl.texOut);
 
     // back to COMMON so the slot is ready for its next submission
     BarrierOn(sl.cmd, sl.texIn, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
     BarrierOn(sl.cmd, sl.texOut, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
-    BarrierOn(sl.cmd, g.texZeroMV, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    BarrierOn(sl.cmd, g.texZeroDepth, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    if (g.texBidir) BarrierOn(sl.cmd, g.texBidir, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    if (g.texCtrl)  BarrierOn(sl.cmd, g.texCtrl,  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    if (g.texUI)    BarrierOn(sl.cmd, g.texUI,    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
-    if (g.texUIA)   BarrierOn(sl.cmd, g.texUIA,   D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COMMON);
+    UnbindEvalParams(sl.cmd);
     sl.cmd->Close();
 
     ID3D12CommandList* lists[] = { sl.cmd };
@@ -993,18 +1118,7 @@ static int FetchCore(uint8_t* outBgr, uint8_t* outRgba) {
     if (!WaitForFence(sl.fenceValue)) { HLog("fence wait fail"); return -1; }
     if (sl.submitMs > 0.0) HPerf("gpu", NowMs() - sl.submitMs);  // blocked time
 
-    const int W = g.w, H = g.h;
-    const size_t planePx = (size_t)W * H;
-    uint8_t* rb = nullptr;
-    D3D12_RANGE readRange{ 0, planePx * 4 };
-    if (FAILED(sl.readbackBuf->Map(0, &readRange, (void**)&rb))) { HLog("readback map fail"); return -1; }
-    if (outRgba) {
-        memcpy(outRgba, rb, planePx * 4);          // already RGBA: no conversion
-    } else if (outBgr) {
-        for (int y = 0; y < H; ++y)
-            RGBA2BGR_row(rb + (size_t)y * W * 4, outBgr + (size_t)y * W * 3, W);
-    }
-    sl.readbackBuf->Unmap(0, nullptr);
+    if (!ReadbackTo(sl, outBgr, outRgba)) return -1;
 
     sl.pending = false;
     sl.fenceValue = 0;
@@ -1020,6 +1134,111 @@ static int DrainCore() {
         if (left < 0) return -1;
     }
     return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Multi-layer chain: N parameter sets per frame, each on its OWN NGX feature.
+//
+// Why one feature per layer instead of N passes on one: a feature owns its
+// temporal history. Running the same feature twice per frame means the second
+// pass sees a history that is bit-identical to its own input -- a degenerate
+// (input, history) pair, since this build feeds zero motion vectors and the
+// network therefore reads "nothing moved, trust the history completely". That
+// doubles the loop gain of the temporal recursion, and a nonlinear recursion
+// with doubled gain oscillates at the frame rate. Measured on a 70%-flat test
+// sequence: the stage-mean level instability of the flat area goes from 0.091
+// (1 layer) to 0.223 (2 layers on one feature) for a static input, and 0.139 ->
+// 0.531 with slow motion inside the flat area -- i.e. 2-4x, worst exactly where
+// the eye notices it. Independent features restore a proper pair per layer.
+//
+// Bonus: the whole chain goes into ONE command list, so a frame costs one
+// upload, one fence wait and one readback instead of N of each.
+//
+//   layers[i]  : per-layer parameters (see DlssnrLayerOpts)
+//   nLayers    : 1..kMaxLayers
+//   reset      : passed to every layer (frame 0 / scene cut)
+// Returns 1 on success, 0 on failure (caller falls back to the N-pass path).
+// ---------------------------------------------------------------------------
+__declspec(dllexport) int dlssnr2_chain(const unsigned char* inBgr,
+                                        unsigned char* outBgr,
+                                        unsigned char* outRgba,
+                                        const DlssnrLayerOpts* layers,
+                                        int nLayers, int reset) {
+    if (!g.inited || !g.features[0] || !layers || !inBgr ||
+        (!outBgr && !outRgba)) {
+        HLog("chain: bad arguments"); return 0;
+    }
+    if (nLayers < 1 || nLayers > kMaxLayers) {
+        HLog("chain: layer count %d out of range", nLayers); return 0;
+    }
+    if (g.pending >= kSlots) { HLog("chain: pipeline full"); return 0; }
+    if (!EnsureFeatures(nLayers)) { HLog("chain: feature setup fail"); return 0; }
+
+    Slot& sl = g.slots[g.submitIdx];
+    const int W = g.w, H = g.h;
+    const double t0 = NowMs();
+
+    // ---- 1. CPU: BGR -> RGBA into this slot's staging buffer (once) ----
+    uint8_t* mapped = nullptr;
+    D3D12_RANGE noRead{ 0, 0 };
+    if (FAILED(sl.uploadBuf->Map(0, &noRead, (void**)&mapped))) {
+        HLog("chain upload map fail"); return 0;
+    }
+    for (int y = 0; y < H; ++y)
+        BGR2RGBA_row(inBgr + (size_t)y * W * 3, mapped + (size_t)y * W * 4, W);
+    sl.uploadBuf->Unmap(0, nullptr);
+    const double t1 = NowMs(); HPerf("convIn", t1 - t0);
+
+    if (FAILED(sl.alloc->Reset()) || FAILED(sl.cmd->Reset(sl.alloc, nullptr))) {
+        HLog("chain cmd reset fail"); return 0;
+    }
+
+    // ---- 2. record upload + every layer into one command list ----
+    UploadToTexIn(sl);
+
+    // texIn / texOut ping-pong; both start and end in COMMON.
+    ID3D12Resource* src = sl.texIn;
+    ID3D12Resource* dst = sl.texOut;
+    for (int k = 0; k < nLayers; ++k) {
+        BarrierOn(sl.cmd, src,
+                  (k == 0) ? D3D12_RESOURCE_STATE_COPY_DEST
+                           : D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                  D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
+        BarrierOn(sl.cmd, dst,
+                  (k == 0) ? D3D12_RESOURCE_STATE_COMMON
+                           : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                  D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+        BindEvalParams(sl.cmd, src, dst, reset);
+        SetLayerParams(layers[k]);
+        NVSDK_NGX_Result r = g.fnEval(sl.cmd, g.features[k], g.params, nullptr);
+        if (r != NVSDK_NGX_Result_Success) {
+            HLog("chain: layer %d EvaluateFeature fail 0x%08X", k, (unsigned)r);
+            sl.cmd->Close();
+            return 0;
+        }
+        ID3D12Resource* t = src; src = dst; dst = t;   // next layer reads this one
+    }
+    const double t2 = NowMs(); HPerf("eval", t2 - t1);
+
+    // `src` now holds the last layer's output; `dst` is the stale input texture.
+    TexToReadback(sl, src);
+    BarrierOn(sl.cmd, src, D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_COMMON);
+    BarrierOn(sl.cmd, dst, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+              D3D12_RESOURCE_STATE_COMMON);
+    UnbindEvalParams(sl.cmd);
+    sl.cmd->Close();
+
+    // ---- 3. one submit, one wait, one readback ----
+    ID3D12CommandList* lists[] = { sl.cmd };
+    g.queue->ExecuteCommandLists(1, lists);
+    const uint64_t v = ++g.fenceValue;
+    g.queue->Signal(g.fence, v);
+    if (!WaitForFence(v)) { HLog("chain fence wait fail"); return 0; }
+    const double t3 = NowMs(); HPerf("gpu", t3 - t2);
+
+    if (!ReadbackTo(sl, outBgr, outRgba)) return 0;
+    const double t4 = NowMs(); HPerf("convOut", t4 - t3);
+    return 1;
 }
 
 // ---- synchronous wrappers (preview path: one frame in, one frame out) ----
