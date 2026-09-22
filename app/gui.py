@@ -527,12 +527,7 @@ class App:
         self.playing = False
         # ---- conversion queue (HandBrake-style) ----
         # Each task snapshots its own params, so every video can convert with
-        # different settings. The worker runs in the background; while a task
-        # is actively on the GPU (_queue_active) the preview shows the
-        # original frame only -- engine2 / vfx / truehdr are process-wide
-        # singletons, and interleaving two videos would corrupt both the
-        # export output and the temporal state. Pause the queue to get the
-        # live DLSS preview back instantly.
+        # different settings. The worker runs in the background.
         self._queue = []
         self._queue_seq = 0
         self._queue_running = False
@@ -540,6 +535,22 @@ class App:
         self._queue_current = None
         self._queue_stop = None
         self._queue_pause = None
+        # ---- who owns the one GPU session ---------------------------------
+        # engine2 / vfx / truehdr are process-wide singletons and dlssnr2_* has
+        # no locking of its own, so the preview and an export worker must never
+        # be inside it at the same time: interleaved calls free each other's
+        # textures, and the preview's process() drains the export's in-flight
+        # frame. Changing 预览上限 mid-export is the sharpest case, because it
+        # forces a re-ensure -> dlssnr2_init -> ReleaseFeatureAndTextures.
+        # Measured on that: the worker loses frames (取回失败), and the two
+        # threads can null-deref inside the DLL (access violation).
+        #
+        # This lock IS the claim. The worker holds it for a whole job; the
+        # preview only ever TRIES it, so the UI can never block on an export.
+        # A plain flag is not enough: one set by the main thread when it
+        # processes the worker's "task_start" message lags the worker by up to
+        # one poll interval, and that window is exactly where it went wrong.
+        self._gpu_claim = threading.Lock()
         # Every file imported in one go becomes a switchable source (a folder
         # import can bring in dozens); source_i is the one on the stage.
         self.sources = []
@@ -1790,11 +1801,32 @@ class App:
                 out[key] = v - (v % 2)
         return out
 
+    def _gpu_busy(self):
+        """True while an export / queue job holds the shared GPU session."""
+        return self._gpu_claim.locked()
+
+    def _gpu_forget_size(self):
+        """A job just used the shared session at ITS size and settings.
+
+        Drop everything cached about that session, so the next preview repaint
+        re-ensures at the preview's own size instead of trusting a stale
+        (size, last-frame) pair and passing reset=0 to a re-created feature.
+        """
+        self._eng_wh = None
+        self._preview_wh = None
+        self._last_dlss_frame = -1
+        self._live_cache = None
+        self._split_key = None
+
     def _ensure_engine(self, w, h):
         """One shared GPU-direct Feature 18 session for preview + export.
 
         dlss_engine.engine2 takes BGR (what cv2 gives us) and returns RGBA straight
         from the GPU readback, so no numpy channel juggling is needed per frame.
+
+        Callers must hold the GPU claim (see _live_dlss_image): this sets the
+        engine's options and can re-init it, both of which corrupt a job that is
+        running at the same time.
         """
         try:
             eng = dlss_engine.engine2
@@ -1813,7 +1845,24 @@ class App:
         self._last_dlss_frame = -1
 
     def _live_dlss_image(self, frame):
+        """Preview-side entry: take the GPU claim, then generate.
+
+        Try-acquire only -- an export job holds this lock for its whole run, and
+        the UI must never wait on it. Returns None when the job owns the session;
+        load_view_img() turns that into the original frame instead of an error.
+        """
+        if not self._gpu_claim.acquire(blocking=False):
+            return None
+        try:
+            return self._live_dlss_image_locked(frame)
+        finally:
+            self._gpu_claim.release()
+
+    def _live_dlss_image_locked(self, frame):
         """Frame -> RGB image (HxWx3) produced on the GPU, or None.
+
+        Holds the GPU claim (see _live_dlss_image). Covers the RTX chain branch
+        too: vfx / truehdr are process-wide singletons that a queue task uses.
 
         RGB and not RGBA: Tk's photo image wants RGB, so handing out RGBA meant
         every paint paid a second full-frame conversion. The engine's buffer is
@@ -1898,9 +1947,9 @@ class App:
         conversion, and the 原图 side goes straight BGR -> RGB instead of the old
         BGR -> RGBA -> RGB round trip (~9 ms -> ~1.6 ms for a 1080p frame).
         """
-        if view == "DLSS" and getattr(self, "_queue_active", False):
-            # the queue owns the GPU right now: degrade to the original frame
-            # instead of fighting the worker over engine2's temporal state
+        if view == "DLSS" and self._gpu_busy():
+            # an export / queue job owns the GPU right now: show the original
+            # frame instead of fighting it over engine2's temporal state
             view = "原图"
         if view == "原图":
             bgr = self._read_frame(frame)
@@ -1916,7 +1965,12 @@ class App:
                 bgr = cv2.resize(bgr, (pw, ph), interpolation=cv2.INTER_AREA)
             return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
         if view == "DLSS":
-            return self._live_dlss_image(frame)
+            img = self._live_dlss_image(frame)
+            if img is None and self._gpu_busy():
+                # a job grabbed the claim between the check above and the call:
+                # same answer as the job case, without a bogus 生成失败 message
+                return self.load_view_img("原图", frame)
+            return img
         return None
 
     def display_view(self):
@@ -2389,7 +2443,12 @@ class App:
         if s['enhance']:
             parts.append(rtx_video.QUALITY_NAMES[s['enhance']])
         if s['hdr']:
-            if rtx_video.truehdr.available():
+            # The probe is what STARTS the NGX core, so it must not run while a
+            # job owns the GPU either. It is cached after the first call, so
+            # this only ever defers the very first probe to a quiet moment.
+            if self._gpu_busy() and getattr(rtx_video.truehdr, "_avail", None) is None:
+                parts.append("SDR → HDR10（导出中，稍后再确认是否支持）")
+            elif rtx_video.truehdr.available():
                 parts.append("SDR → HDR10（中灰 %d，峰值 %d nits）"
                              % (s['hdr_middle_gray'], s['hdr_max_luminance']))
             else:
@@ -2406,10 +2465,14 @@ class App:
 
     def _refresh_dlss(self):
         self._live_debounce = None
-        try:
-            dlss_engine.engine2.set_settings(self._collect_settings())
-        except Exception as ex:
-            self.logln("[DLSS 参数] " + str(ex))
+        # Never push preview parameters into a session a job is using: they
+        # would silently retune the frames it is still writing (and the size
+        # change path can re-init it). The job set its own options already.
+        if not self._gpu_busy():
+            try:
+                dlss_engine.engine2.set_settings(self._collect_settings())
+            except Exception as ex:
+                self.logln("[DLSS 参数] " + str(ex))
         self._refresh_rtx_note()
         self._live_cache = None
         self._split_frame = -1
@@ -2718,7 +2781,7 @@ class App:
         if self._queue_pause.is_set():
             self._queue_pause.clear()
             self.q_pause_btn.config(text="▶ 继续")
-            self.logln("[队列] 已暂停（当前帧完成后停住；预览恢复实时 DLSS）")
+            self.logln("[队列] 已暂停（当前帧完成后停住；任务占用 GPU 期间预览显示原图）")
         else:
             self._queue_pause.set()
             self.q_pause_btn.config(text="⏸ 暂停")
@@ -2745,8 +2808,7 @@ class App:
                         t["status"] = "转换中"; t["progress"] = 0.0
                         self._queue_current = t
                         self._queue_active = True
-                        self._live_cache = None
-                        self._split_key = None
+                        self._gpu_forget_size()
                         self.pbar["maximum"] = max(t["n"], 1); self.pbar["value"] = 0
                         self.set_status(f"队列 {t['name']} …")
                         self.set_stats(total=t["n"])
@@ -2782,8 +2844,7 @@ class App:
                             self._queue_current["id"] == tid:
                         self._queue_current = None
                         self._queue_active = False
-                        self._live_cache = None
-                        self._split_key = None
+                        self._gpu_forget_size()
                         self.pbar["value"] = 0
                     self._queue_refresh()
                     try:
@@ -2795,8 +2856,7 @@ class App:
                     self._queue_running = False
                     self._queue_active = False
                     self._queue_current = None
-                    self._live_cache = None
-                    self._split_key = None
+                    self._gpu_forget_size()
                     self.pbar["value"] = 0
                     self.set_status(f"队列完成（成功 {completed} / 失败 {failed}"
                                     + (f" / 取消 {cancelled}" if cancelled else "") + "）")
@@ -2811,11 +2871,11 @@ class App:
                                         + (f" / 取消 {cancelled}" if cancelled else ""))
                     idle = True
                 elif kind == "queue_idle":
-                    # paused with nothing active: release the GPU for preview
+                    # between tasks (or paused before one starts) the worker
+                    # holds no claim, so the live preview can come back
                     if self._queue_active:
                         self._queue_active = False
-                        self._live_cache = None
-                        self._split_key = None
+                        self._gpu_forget_size()
                         try:
                             self.display_view()
                         except Exception:
@@ -2855,7 +2915,16 @@ class App:
             # verdict comes back synchronously from the tagger ("ok" / "fail"
             # / "cancelled"); the matching task_done message is already queued
             # for _poll_queue, which assigns the same status + log line there.
-            verdict = self._run_queue_task(nxt)
+            try:
+                verdict = self._run_queue_task(nxt)
+            except Exception as ex:
+                # One bad task must not kill the worker: without this the row
+                # stayed 「转换中」 forever, the queue never reported 完成 and
+                # the start button stayed disabled.
+                traceback.print_exc()
+                q.put(("log", "[队列] %s 异常终止: %s" % (nxt["name"], ex)))
+                q.put(("task_done", nxt["id"], False, nxt["out_path"]))
+                verdict = "fail"
             if verdict == "ok":
                 completed += 1
             elif verdict == "cancelled":
@@ -2875,11 +2944,17 @@ class App:
     def _run_queue_task(self, task):
         """Run one queue task through the shared export implementation.
 
-        The impl writes ("progress"/"log"/"done") into self._prog_q; here it
-        is temporarily swapped for a tagger that routes them to the shared
-        queue with the task id attached. The single-export path is untouched
-        because the queue worker never runs concurrently with it (guarded in
-        export_dlss / start_queue).
+        The impl writes ("progress"/"log"/"done") into the sink it is given;
+        here that is a tagger which routes them to the shared queue with the
+        task id attached. The sink is a PARAMETER, not a swap of self._prog_q:
+        the main thread's _poll_queue reads that attribute while the worker
+        runs, and pointing it at the tagger made the pump die on the first tick
+        (AttributeError: '_Tagger' object has no attribute 'get_nowait'), after
+        which no task_done / queue_done was ever processed and the queue hung
+        on 「转换中」 with the start button disabled.
+
+        The single-export path is untouched because the queue worker never runs
+        concurrently with it (guarded in export_dlss / start_queue).
         """
         q = self._prog_q
         ffmpeg = self._queue_ffmpeg
@@ -2900,6 +2975,12 @@ class App:
                 paused_note["shown"] = False
             return not self._queue_stop.is_set()
 
+        # The App's stop event, captured for the tagger below: `self` inside
+        # _Tagger is the tagger, so reaching for self._queue_stop there raised
+        # AttributeError and killed the queue worker right after its first
+        # task (the row stayed 「转换中」 and the queue never reported 完成).
+        stop_ev = self._queue_stop
+
         class _Tagger:
             def put(self, m):
                 if not m:
@@ -2912,22 +2993,18 @@ class App:
                     q.put(m)
                 elif kind == "done":
                     _, ok, path = m
-                    if self._queue_stop.is_set() and not ok:
+                    if stop_ev.is_set() and not ok:
                         box["verdict"] = "cancelled"
                         q.put(("task_done", tid, "cancelled", path))
                     else:
                         box["verdict"] = "ok" if ok else "fail"
                         q.put(("task_done", tid, bool(ok), path))
 
-        saved = self._prog_q
-        self._prog_q = _Tagger()
-        try:
-            self._export_job_impl(ffmpeg, enc, enc_args, tag, out_path,
-                                  settings, n, fps, w, h, task["src"],
-                                  pause_hook=wait_if_paused,
-                                  stop_hook=lambda: self._queue_stop.is_set())
-        finally:
-            self._prog_q = saved
+        self._export_job_impl(ffmpeg, enc, enc_args, tag, out_path,
+                              settings, n, fps, w, h, task["src"],
+                              pause_hook=wait_if_paused,
+                              stop_hook=lambda: self._queue_stop.is_set(),
+                              sink=_Tagger())
         return box.get("verdict", "fail")
 
     # ---------- export ----------
@@ -3043,6 +3120,9 @@ class App:
                     _, ok, out_path = msg
                     done = True
                     self._exporting = False
+                    # the job used the session at ITS size/settings: re-ensure
+                    # and repaint the live preview (it was frozen for the run)
+                    self._gpu_forget_size()
                     self.pbar["value"] = 0
                     if ok:
                         self.set_status("完成")
@@ -3052,19 +3132,62 @@ class App:
                         self.set_status("导出失败")
                         self.clear_stats()
                         messagebox.showerror("导出失败", "导出失败，详见日志。")
+                    try:
+                        self.display_view()
+                    except Exception:
+                        pass
         except queue.Empty:
             pass
         if not done:
             self.root.after(100, self._poll_progress)
 
     def _export_job_impl(self, ffmpeg, enc, enc_args, tag, out_path, settings,
-                           n, fps, w, h, src_path, pause_hook=None, stop_hook=None):
+                         n, fps, w, h, src_path, pause_hook=None, stop_hook=None,
+                         sink=None):
+        """Claim the shared GPU session for a whole job, then run it.
+
+        The claim is taken HERE, on the worker thread, so it is held from before
+        the first frame until after the last one -- see the note on _gpu_claim.
+        Together with the try-acquire in _live_dlss_image this is what keeps the
+        preview out of the DLL while a job runs.
+
+        `sink` is where progress/log/done messages go: the queue passes a tagger
+        that forwards them with the task id attached, the single export passes
+        nothing. It is a parameter rather than a swap of self._prog_q on
+        purpose -- the main thread's _poll_queue keeps reading that attribute
+        while this runs.
+
+        "done" is queued only AFTER the claim is released. The main thread
+        answers it by repainting the live preview; if that happened while we
+        still held the claim it would paint the original frame and never have a
+        reason to try again.
+        """
+        sink = sink if sink is not None else self._prog_q
+        box = {"ok": False}
+
+        def done(ok):
+            box["ok"] = bool(ok)
+
+        try:
+            with self._gpu_claim:
+                self._export_job(ffmpeg, enc, enc_args, tag, out_path, settings,
+                                 n, fps, w, h, src_path,
+                                 pause_hook=pause_hook, stop_hook=stop_hook,
+                                 done=done, sink=sink)
+        finally:
+            sink.put(("done", box["ok"], out_path))
+
+    def _export_job(self, ffmpeg, enc, enc_args, tag, out_path, settings,
+                    n, fps, w, h, src_path, pause_hook=None, stop_hook=None,
+                    done=None, sink=None):
         """Pipelined export: decode -> [RTX Video stages] -> DLSS -> ffmpeg stdin.
 
         Shared by single export and the queue worker. pause_hook (if given) is
         called once per frame and must block while paused, returning False to
         abort; stop_hook aborts when it returns True. Both default to
-        no-op so the single-export path is unchanged.
+        no-op so the single-export path is unchanged. done(ok) reports the
+        verdict; _export_job_impl supplies it so the message is queued after the
+        GPU claim is released.
 
         Two paths, chosen by whether any RTX Video stage is on:
 
@@ -3081,6 +3204,10 @@ class App:
         ffmpeg format is the one that matches (verified with pure-colour probes).
         """
         import time
+        if sink is None:
+            sink = self._prog_q
+        if done is None:                  # called without the claim wrapper
+            done = lambda ok: sink.put(("done", ok, out_path))
         view = int(settings['output_view']); mix = float(settings['output_mix'])
         use_dlss = bool(settings.get('dlss', 1))
         layers = [dict(l) for l in (settings.get('layers') or []) if l]
@@ -3091,7 +3218,7 @@ class App:
         if multi:
             # worth saying out loud: this is N passes per frame, i.e. N times the
             # neural cost, and the double-buffered overlap no longer applies
-            self._prog_q.put(("log", "多层 DLSSNR：每帧依次执行 %d 层"
+            sink.put(("log", "多层 DLSSNR：每帧依次执行 %d 层"
                                      "（耗时约为单层的 %d 倍）" % (len(layers), len(layers))))
 
         pipe = None
@@ -3109,8 +3236,8 @@ class App:
                     dlss_engine=dlss_engine.ChainEngine(settings)
                     if use_dlss else None)
             except Exception as ex:
-                self._prog_q.put(("log", "[RTX Video] " + str(ex)))
-                self._prog_q.put(("done", False, out_path))
+                sink.put(("log", "[RTX Video] " + str(ex)))
+                done(False)
                 return
             stages = [x for x in [
                 rtx_video.QUALITY_NAMES.get(int(settings.get('vsr_quality', 0)), "")
@@ -3120,7 +3247,7 @@ class App:
                 rtx_video.QUALITY_NAMES.get(int(settings.get('enhance', 0)), "")
                 if int(settings.get('enhance', 0)) else "",
                 "TrueHDR" if settings.get('hdr') else ""] if x]
-            self._prog_q.put(("log", "处理链路: %s → %dx%d (%s)"
+            sink.put(("log", "处理链路: %s → %dx%d (%s)"
                               % (" + ".join(stages) if stages else "无处理（仅重新编码）",
                                  out_w, out_h, in_fmt)))
 
@@ -3232,7 +3359,7 @@ class App:
             recent_t.append(now)
 
             if not n:
-                self._prog_q.put(("progress", emitted, n, None, None, None))
+                sink.put(("progress", emitted, n, None, None, None))
                 return
             if not force and (now - last_report) < 0.2 and emitted < n:
                 return
@@ -3250,7 +3377,7 @@ class App:
             # ETA from the overall average: stable and monotone, unlike the window
             avg = emitted / elapsed
             eta = (n - emitted) / avg if avg > 1e-6 else None
-            self._prog_q.put(("progress", emitted, n, speed, elapsed, eta))
+            sink.put(("progress", emitted, n, speed, elapsed, eta))
 
         def emit(o, src_bgr, idx):
             """Post-process one finished frame and hand it to the writer.
@@ -3454,8 +3581,13 @@ class App:
             if not ok:
                 err_msg = f"ffmpeg 退出码 {code}: " + err.decode("utf-8", "replace")[-800:]
             if err_msg:
-                self._prog_q.put(("log", err_msg))
-            self._prog_q.put(("done", ok, out_path))
+                # Any recorded error means the file is incomplete. ffmpeg still
+                # exits 0 on a truncated rawvideo stream (piped input that just
+                # stops), so exit code alone reported 「完成」 for a broken file
+                # -- a cancelled job used to come back as a success too.
+                sink.put(("log", err_msg))
+                ok = False
+            done(ok)
 
     def _iter_frames(self):
         cap = cv2.VideoCapture(self.video)
